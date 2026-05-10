@@ -1,0 +1,75 @@
+name: Build s&box
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Compile Engine
+    runs-on: windows-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # полная история нужна Bootstrap-скрипту
+          submodules: recursive   # на случай наличия сабмодулей
+
+      # ── 2. .NET 10 SDK ────────────────────────────────────────────────────
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      # ── 3. Кэш NuGet-пакетов ─────────────────────────────────────────────
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.nuget/packages
+            ${{ github.workspace }}/.nuget
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      # ── 4. Кэш загружаемых зависимостей Bootstrap ────────────────────────
+      - name: Cache Bootstrap dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/deps
+          key: deps-${{ runner.os }}-${{ hashFiles('Bootstrap.bat') }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      # ── 5. Запуск Bootstrap.bat ───────────────────────────────────────────
+      - name: Run Bootstrap
+        shell: cmd
+        run: Bootstrap.bat
+        env:
+          CI: true               # Bootstrap может проверять эту переменную
+
+      # ── 6. Сохранение артефактов сборки ──────────────────────────────────
+      - name: Upload build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbox-build-${{ github.sha }}
+          path: |
+            game/bin/
+          retention-days: 7
+
+      # ── 7. Краткий отчёт при ошибке ──────────────────────────────────────
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.sha }}
+          path: |
+            **/*.log
+            **/*.binlog
+          retention-days: 3
