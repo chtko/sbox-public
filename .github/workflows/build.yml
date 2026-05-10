@@ -3,11 +3,11 @@ name: Build & Release s&box
 on:
   push:
     tags:
-      - 'v*'          # срабатывает на теги вида v26.04.28-abc1234 от sync-upstream
-  workflow_dispatch:  # ручной запуск
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write     # нужно для создания Release
+  contents: write
 
 jobs:
   build:
@@ -36,7 +36,7 @@ jobs:
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props') }}
           restore-keys: nuget-${{ runner.os }}-
 
-      # ── 4. Кэш зависимостей Bootstrap ────────────────────────────────────
+      # ── 4. Кэш зависимостей Bootstrap (нативные бинарники) ───────────────
       - name: Cache Bootstrap dependencies
         uses: actions/cache@v4
         with:
@@ -44,23 +44,29 @@ jobs:
           key: deps-${{ runner.os }}-${{ hashFiles('Bootstrap.bat') }}
           restore-keys: deps-${{ runner.os }}-
 
-      # ── 5. Сборка ─────────────────────────────────────────────────────────
+      # ── 5. Bootstrap: скачивает нативный движок + собирает C# часть ───────
       - name: Run Bootstrap
         shell: cmd
         run: Bootstrap.bat
         env:
           CI: true
 
-      # ── 6. Упаковываем артефакт в zip ─────────────────────────────────────
-      - name: Package build output
+      # ── 6. Упаковываем всё в zip (нативники + managed DLL) ────────────────
+      - name: Package full build
         shell: pwsh
         run: |
           $tag = "${{ github.ref_name }}"
-          $zipName = "sbox-build-${tag}.zip"
-          Compress-Archive -Path "game\bin\*" -DestinationPath $zipName
-          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+          $zipName = "sbox-$tag.zip"
 
-      # ── 7. Загружаем логи при ошибке ──────────────────────────────────────
+          # Пакуем всю папку game/ — там и нативный движок, и C# DLL
+          Compress-Archive -Path "game\*" -DestinationPath $zipName
+
+          $sizeMB = [math]::Round((Get-Item $zipName).Length / 1MB, 1)
+          echo "ZIP_NAME=$zipName"   >> $env:GITHUB_ENV
+          echo "ZIP_SIZE=${sizeMB} MB" >> $env:GITHUB_ENV
+          Write-Host "✅ Упаковано: $zipName ($sizeMB MB)"
+
+      # ── 7. Логи при ошибке ────────────────────────────────────────────────
       - name: Upload logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -71,7 +77,7 @@ jobs:
             **/*.binlog
           retention-days: 3
 
-      # ── 8. Создаём GitHub Release и заливаем zip ──────────────────────────
+      # ── 8. Создаём Release и заливаем готовый zip ─────────────────────────
       - name: Create GitHub Release
         if: success()
         uses: softprops/action-gh-release@v2
@@ -79,8 +85,19 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "s&box ${{ github.ref_name }}"
           body: |
-            🔄 Автоматическая сборка из [Facepunch/sbox-public](https://github.com/Facepunch/sbox-public)
-            
-            **Тег:** `${{ github.ref_name }}`
+            ## 📦 s&box ${{ github.ref_name }}
+
+            Автоматическая сборка из [Facepunch/sbox-public](https://github.com/Facepunch/sbox-public)
+
+            ### Содержимое архива
+            - ✅ Нативный движок (C++ бинарники, скачаны Bootstrap'ом)
+            - ✅ Managed часть (C# DLL, собрана из исходников)
+
+            ### Как запустить
+            1. Скачай `sbox-${{ github.ref_name }}.zip`
+            2. Распакуй в любую папку
+            3. Запусти `sbox.exe`
+
+            > ⚠️ Нативные бинарники распространяются под [s&box EULA](https://sbox.game/eula)
           files: ${{ env.ZIP_NAME }}
           fail_on_unmatched_files: true
