@@ -50,6 +50,7 @@ jobs:
         run: Bootstrap.bat
         env:
           CI: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # ── 6. Упаковываем всё в zip (нативники + managed DLL) ────────────────
       - name: Package full build
