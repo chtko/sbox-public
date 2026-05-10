@@ -62,13 +62,7 @@ jobs:
           # 7-Zip всегда есть на windows-latest
           $7z = "C:\Program Files\7-Zip\7z.exe"
 
-          & $7z a `
-            -t7z        `   # формат 7z
-            -mx=9        `   # максимальное сжатие
-            -mmt=on      `   # многопоток
-            -v1900m      `   # части по 1900 МБ (влезает в лимит GitHub 2 ГБ)
-            $outName        `
-            "game\*"
+          & $7z a -t7z -mx=9 -mmt=on -v1900m $outName "game\*"
 
           # Собираем список всех частей (sbox-vX.7z.001, .002, ...)
           $parts = Get-ChildItem "$outName.*" | Sort-Object Name
