@@ -52,20 +52,34 @@ jobs:
           CI: true
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 6. Упаковываем всё в zip (нативники + managed DLL) ────────────────
-      - name: Package full build
+      # ── 6. Упаковываем в .7z с максимальным сжатием, части по 1900 МБ ──────
+      - name: Package full build (7z split)
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          $zipName = "sbox-$tag.zip"
+          $tag     = "${{ github.ref_name }}"
+          $outName = "sbox-$tag.7z"
 
-          # Пакуем всю папку game/ — там и нативный движок, и C# DLL
-          Compress-Archive -Path "game\*" -DestinationPath $zipName
+          # 7-Zip всегда есть на windows-latest
+          $7z = "C:\Program Files\7-Zip\7z.exe"
 
-          $sizeMB = [math]::Round((Get-Item $zipName).Length / 1MB, 1)
-          echo "ZIP_NAME=$zipName"   >> $env:GITHUB_ENV
-          echo "ZIP_SIZE=${sizeMB} MB" >> $env:GITHUB_ENV
-          Write-Host "✅ Упаковано: $zipName ($sizeMB MB)"
+          & $7z a `
+            -t7z        `   # формат 7z
+            -mx=9        `   # максимальное сжатие
+            -mmt=on      `   # многопоток
+            -v1900m      `   # части по 1900 МБ (влезает в лимит GitHub 2 ГБ)
+            $outName        `
+            "game\*"
+
+          # Собираем список всех частей (sbox-vX.7z.001, .002, ...)
+          $parts = Get-ChildItem "$outName.*" | Sort-Object Name
+          if (-not $parts) { $parts = Get-ChildItem $outName }   # если влезло в один файл
+
+          $total = [math]::Round(($parts | Measure-Object Length -Sum).Sum / 1MB, 1)
+          Write-Host "✅ Упаковано $($parts.Count) часть(ей), итого: $total МБ"
+
+          # Пишем список файлов для upload-artifact
+          $fileList = ($parts.FullName) -join "`n"
+          echo "ARTIFACT_FILES=$($parts.FullName -join ',')" >> $env:GITHUB_ENV
 
       # ── 7. Логи при ошибке ────────────────────────────────────────────────
       - name: Upload logs on failure
@@ -78,7 +92,7 @@ jobs:
             **/*.binlog
           retention-days: 3
 
-      # ── 8. Создаём Release и заливаем готовый zip ─────────────────────────
+      # ── 8. Создаём Release и заливаем части архива ───────────────────────
       - name: Create GitHub Release
         if: success()
         uses: softprops/action-gh-release@v2
@@ -94,11 +108,12 @@ jobs:
             - ✅ Нативный движок (C++ бинарники, скачаны Bootstrap'ом)
             - ✅ Managed часть (C# DLL, собрана из исходников)
 
-            ### Как запустить
-            1. Скачай `sbox-${{ github.ref_name }}.zip`
-            2. Распакуй в любую папку
-            3. Запусти `sbox.exe`
+            ### Как распаковать
+            1. Скачай **все части** `sbox-${{ github.ref_name }}.7z.001`, `.002`, ...
+            2. Положи их в одну папку
+            3. Открой `.001` через [7-Zip](https://www.7-zip.org/) → `Extract Here`
+            4. Запусти `sbox.exe`
 
             > ⚠️ Нативные бинарники распространяются под [s&box EULA](https://sbox.game/eula)
-          files: ${{ env.ZIP_NAME }}
+          files: sbox-${{ github.ref_name }}.7z.*
           fail_on_unmatched_files: true
