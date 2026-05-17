@@ -1,0 +1,168 @@
+name: Sync with Upstream (Version-based)
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # раз в день в 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: Facepunch/sbox-public
+  BRANCH: master
+
+jobs:
+  check-and-sync:
+    name: Check version & sync
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Получаем последний коммит upstream ─────────────────────────────
+      - name: Get upstream latest commit
+        id: upstream
+        run: |
+          COMMIT_JSON=$(curl -sf \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ env.UPSTREAM }}/commits/${{ env.BRANCH }}")
+
+          SHA=$(echo "$COMMIT_JSON"  | jq -r '.sha')
+          DATE=$(echo "$COMMIT_JSON" | jq -r '.commit.committer.date')
+          MSG=$(echo "$COMMIT_JSON"  | jq -r '.commit.message | split("\n")[0]')
+
+          # Дата в формате YY.MM.DD — именно так выглядит версия sbox (26.04.28)
+          VERSION_DATE=$(date -d "$DATE" +"%y.%m.%d")
+
+          echo "sha=$SHA"                    >> $GITHUB_OUTPUT
+          echo "date=$DATE"                  >> $GITHUB_OUTPUT
+          echo "version_date=$VERSION_DATE"  >> $GITHUB_OUTPUT
+          echo "message=$MSG"                >> $GITHUB_OUTPUT
+
+          echo "⬆️  Upstream: $SHA | $VERSION_DATE | $MSG"
+
+      # ── 2. Читаем маркер последней синхронизации из форка ─────────────────
+      - name: Get fork's last synced version
+        id: fork
+        run: |
+          CONTENT=$(curl -sf \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/.last-sync-version" \
+            || echo '{}')
+
+          ENCODED=$(echo "$CONTENT" | jq -r '.content // ""')
+          if [ -n "$ENCODED" ]; then
+            LAST=$(echo "$ENCODED" | base64 -d | tr -d '[:space:]')
+          else
+            LAST="none"
+          fi
+
+          echo "version_date=$LAST" >> $GITHUB_OUTPUT
+          echo "📌 Последняя синхронизация: $LAST"
+
+      # ── 3. Сравниваем даты ────────────────────────────────────────────────
+      - name: Decide whether to sync
+        id: compare
+        run: |
+          UP="${{ steps.upstream.outputs.version_date }}"
+          FK="${{ steps.fork.outputs.version_date }}"
+
+          if [ "$UP" = "$FK" ]; then
+            echo "✅ Уже на актуальной версии ($UP). Пропускаем."
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+          else
+            echo "🔄 Новая версия: $FK → $UP"
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 4. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout fork
+        if: steps.compare.outputs.needs_sync == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 5. Синхронизация с upstream ───────────────────────────────────────
+      - name: Fetch & reset to upstream
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "https://github.com/${{ env.UPSTREAM }}.git"
+          git fetch upstream ${{ env.BRANCH }}
+          git reset --hard upstream/${{ env.BRANCH }}
+
+      # ── 6. Записываем маркер ─────────────────────────────────────────────
+      # ── Восстанавливаем .github/ после reset ────────────────────────────
+      - name: Restore .github folder
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          git checkout HEAD@{1} -- .github/
+          git checkout HEAD@{1} -- dll/ 2>/dev/null || echo "dll/ не найдена, пропускаю"
+          echo "✅ .github/ и dll/ восстановлены"
+
+      - name: Write sync marker
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          echo "${{ steps.upstream.outputs.version_date }}" > .last-sync-version
+          git add -f .last-sync-version
+          git commit -m "chore: sync to upstream ${{ steps.upstream.outputs.version_date }} [${{ steps.upstream.outputs.sha }}]"
+
+      # ── 7. Push ───────────────────────────────────────────────────────────
+      - name: Push to fork
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: git push origin refs/heads/${{ env.BRANCH }} --force-with-lease
+
+      # ── 8. Создаём тег ────────────────────────────────────────────────────
+      - name: Tag the sync
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          VER="${{ steps.upstream.outputs.version_date }}"
+          SHA="${{ steps.upstream.outputs.sha }}"
+          BASE_TAG="v${VER}"
+          
+          # Если тег уже существует — добавляем счётчик
+          git fetch --tags
+          N=1
+          TAG="${BASE_TAG}"
+          while git rev-parse "$TAG" >/dev/null 2>&1; do
+            N=$((N+1))
+            TAG="${BASE_TAG}-r${N}"
+          done
+          
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "🏷️  Тег: $TAG"
+
+      # ── 9. Запускаем build.yml вручную через API ─────────────────────────
+      - name: Trigger build workflow
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+
+          # Вызываем build.yml через workflow_dispatch
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST             -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}"             -H "Accept: application/vnd.github+json"             "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches"             -d "{"ref":"$TAG"}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo "✅ build.yml успешно запущен для тега $TAG (HTTP $HTTP_CODE)"
+          else
+            echo "❌ Не удалось запустить build.yml (HTTP $HTTP_CODE)"
+            echo "Ответ API: $BODY"
+            echo "Проверь что PAT_TOKEN добавлен в секреты репо и имеет scope 'workflow'"
+          fi
+
+      # ── 10. Summary ───────────────────────────────────────────────────────
+      - name: Job summary
+        run: |
+          if [ "${{ steps.compare.outputs.needs_sync }}" = "true" ]; then
+            echo "### 🚀 Синхронизировано: \`${{ steps.upstream.outputs.version_date }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**SHA:** \`${{ steps.upstream.outputs.sha }}\`"                          >> $GITHUB_STEP_SUMMARY
+            echo "**Коммит:** ${{ steps.upstream.outputs.message }}"                       >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ Форк актуален — \`${{ steps.upstream.outputs.version_date }}\`"  >> $GITHUB_STEP_SUMMARY
+          fi
