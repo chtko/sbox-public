@@ -1,0 +1,188 @@
+name: Build & Release s&box
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Compile Engine
+    runs-on: windows-latest
+
+    steps:
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          ref: ${{ github.ref }}
+
+      # ── 2. .NET 10 SDK ────────────────────────────────────────────────────
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      # ── 3. Кэш NuGet ─────────────────────────────────────────────────────
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      # ── 4. Кэш зависимостей Bootstrap (нативные бинарники) ───────────────
+      - name: Cache Bootstrap dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/deps
+          key: deps-${{ runner.os }}-${{ hashFiles('Bootstrap.bat') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      # ── 5. Bootstrap: скачивает нативный движок + собирает C# часть ───────
+      - name: Run Bootstrap
+        shell: cmd
+        run: Bootstrap.bat
+        env:
+          CI: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 6. Применяем патч engine2.dll + подменяем steam_api64.dll ───────────
+      - name: Apply patches
+        shell: pwsh
+        run: |
+          $win64 = "game\bin\win64"
+
+          # -- Патч engine2.dll (убираем MessageBox "Steam Not Found") ----------
+          $dll = "$win64\engine2.dll"
+          $bytes = [System.IO.File]::ReadAllBytes($dll)
+
+          $patches = @(
+            @{ off=0x30E2E4; src=[byte[]](0x0F,0x84,0xC4,0x00,0x00,0x00); dst=[byte[]](0x90,0x90,0x90,0x90,0x90,0x90); name="SteamClient null check" },
+            @{ off=0x30E2FA; src=[byte[]](0x0F,0x84,0xAE,0x00,0x00,0x00); dst=[byte[]](0x90,0x90,0x90,0x90,0x90,0x90); name="SteamUser null check" }
+          )
+
+          foreach ($p in $patches) {
+            $found = $bytes[$p.off..($p.off+5)]
+            if (($found -join ",") -eq (($p.src -join ","))) {
+              [System.Array]::Copy($p.dst, 0, $bytes, $p.off, 6)
+              Write-Host "Пропатчено: $($p.name)"
+            } elseif (($found -join ",") -eq (($p.dst -join ","))) {
+              Write-Host "Уже пропатчено: $($p.name)"
+            } else {
+              Write-Warning "Не совпало ($($p.name)) - версия DLL изменилась?"
+            }
+          }
+          [System.IO.File]::WriteAllBytes($dll, $bytes)
+
+          # -- Подмена steam_api64.dll из папки dll/ репозитория ---------------
+          $ourDll = Join-Path $env:GITHUB_WORKSPACE "dll\steam_api64.dll"
+
+          if (Test-Path $ourDll) {
+            Copy-Item $ourDll "$win64\steam_api64.dll" -Force
+            Write-Host "steam_api64.dll заменён из dll/"
+          } else {
+            Write-Error "dll/steam_api64.dll не найден в репозитории!"
+            exit 1
+          }
+
+          Set-Content "$win64\steam_appid.txt" "590830"
+          Write-Host "steam_appid.txt создан"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 7. Упаковываем в .7z с максимальным сжатием, части по 1900 МБ ──────
+      - name: Package full build (7z split)
+        shell: pwsh
+        run: |
+          $tag     = "${{ github.ref_name }}"
+          $outName = "sbox-$tag.7z"
+
+          # 7-Zip всегда есть на windows-latest
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+
+          & $7z a -t7z -mx=9 -mmt=on -v1900m $outName "game\*"
+
+          # Собираем список всех частей (sbox-vX.7z.001, .002, ...)
+          $parts = Get-ChildItem "$outName.*" | Sort-Object Name
+          if (-not $parts) { $parts = Get-ChildItem $outName }   # если влезло в один файл
+
+          $total = [math]::Round(($parts | Measure-Object Length -Sum).Sum / 1MB, 1)
+          Write-Host "✅ Упаковано $($parts.Count) часть(ей), итого: $total МБ"
+
+          # Пишем список файлов для upload-artifact
+          $fileList = ($parts.FullName) -join "`n"
+          echo "ARTIFACT_FILES=$($parts.FullName -join ',')" >> $env:GITHUB_ENV
+
+      # ── 7. Логи при ошибке ────────────────────────────────────────────────
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.ref_name }}
+          path: |
+            **/*.log
+            **/*.binlog
+          retention-days: 3
+
+      # ── 8. Формируем тег и название релиза ──────────────────────────────
+      - name: Generate release name
+        id: release_name
+        shell: pwsh
+        run: |
+          $token = "${{ secrets.GITHUB_TOKEN }}"
+          $repo  = "${{ github.repository }}"
+
+          # Дата по Омскому времени (UTC+6) — пасхалка ;)
+          $omskTime = (Get-Date).ToUniversalTime().AddHours(6)
+          $date     = $omskTime.ToString("dd.MM.yyyy")
+
+          # Считаем сколько релизов уже было сегодня по тегу
+          $headers  = @{ Authorization = "Bearer $token" }
+          $releases = Invoke-RestMethod "https://api.github.com/repos/$repo/releases" -Headers $headers
+          $todayCount = ($releases | Where-Object { $_.tag_name -like "$date*" }).Count
+
+          # Тег: дд.мм.гггг, при повторе: дд.мм.гггг-2, дд.мм.гггг-3...
+          if ($todayCount -eq 0) {
+            $releaseTag  = $date
+            $releaseName = "s&box master $date"
+          } else {
+            $num         = $todayCount + 1
+            $releaseTag  = "$date-$num"
+            $releaseName = "s&box master $date #$num"
+          }
+
+          echo "tag=$releaseTag"   >> $env:GITHUB_OUTPUT
+          echo "name=$releaseName" >> $env:GITHUB_OUTPUT
+          Write-Host "Tag: $releaseTag | Release: $releaseName"
+
+      # ── 9. Создаём Release и заливаем части архива ───────────────────────
+      - name: Create GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_name.outputs.tag }}
+          name: ${{ steps.release_name.outputs.name }}
+          body: |
+            ## 📦 ${{ steps.release_name.outputs.name }}
+
+            Автоматическая сборка из [Facepunch/sbox-public](https://github.com/Facepunch/sbox-public)
+
+            ### Содержимое архива
+            - ✅ Нативный движок (C++ бинарники, скачаны Bootstrap'ом)
+            - ✅ Managed часть (C# DLL, собрана из исходников)
+            - ✅ Goldberg Steam Emulator (steam_api64.dll)
+
+            ### Как распаковать
+            1. Скачай **все части** `sbox-${{ github.ref_name }}.7z.001`, `.002`, ...
+            2. Положи их в одну папку
+            3. Открой `.001` через [7-Zip](https://www.7-zip.org/) → `Extract Here`
+            4. Запусти `sbox.exe`
+          files: sbox-${{ github.ref_name }}.7z.*
+          fail_on_unmatched_files: true
