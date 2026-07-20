@@ -1,0 +1,259 @@
+# ════════════════════════════════════════════════════════════════════
+#  SYNC WITH UPSTREAM (Version-based)
+#
+#  Синхронизация с Facepunch/sbox-public по версии (YY.MM.DD)
+#  Сохраняет кастомные файлы: dll/, gen_manifest.py
+# ════════════════════════════════════════════════════════════════════
+
+name: Sync with Upstream (Version-based)
+
+on:
+  schedule:
+    - cron: '0 8 * * *'   # раз в день в 08:00 UTC (14:00 Омск)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: Facepunch/sbox-public
+  BRANCH: master
+
+jobs:
+  check-and-sync:
+    name: Check version & sync
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      # ── 1. Получаем последний коммит upstream ─────────────────────────────
+      - name: Get upstream latest commit
+        id: upstream
+        run: |
+          COMMIT_JSON=$(curl -sf \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ env.UPSTREAM }}/commits/${{ env.BRANCH }}")
+
+          SHA=$(echo "$COMMIT_JSON"  | jq -r '.sha')
+          DATE=$(echo "$COMMIT_JSON"  | jq -r '.commit.committer.date')
+          MSG=$(echo "$COMMIT_JSON"  | jq -r '.commit.message | split("\n")[0]')
+
+          # Дата в формате YY.MM.DD — именно так выглядит версия sbox (26.04.28)
+          VERSION_DATE=$(date -d "$DATE" +"%y.%m.%d")
+
+          echo "sha=$SHA"                    >> $GITHUB_OUTPUT
+          echo "date=$DATE"                  >> $GITHUB_OUTPUT
+          echo "version_date=$VERSION_DATE"  >> $GITHUB_OUTPUT
+          echo "message=$MSG"                >> $GITHUB_OUTPUT
+
+          echo "⬆️  Upstream: $SHA | $VERSION_DATE | $MSG"
+
+      # ── 2. Читаем маркер последней синхронизации из форка ─────────────────
+      - name: Get fork's last synced version
+        id: fork
+        run: |
+          CONTENT=$(curl -sf \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/.last-sync-version" \
+            || echo '{}')
+
+          ENCODED=$(echo "$CONTENT" | jq -r '.content // ""')
+          if [ -n "$ENCODED" ]; then
+            LAST=$(echo "$ENCODED" | base64 -d | tr -d '[:space:]')
+          else
+            LAST="none"
+          fi
+
+          echo "version_date=$LAST" >> $GITHUB_OUTPUT
+          echo "📌 Последняя синхронизация: $LAST"
+
+      # ── 3. Сравниваем даты ────────────────────────────────────────────────
+      - name: Decide whether to sync
+        id: compare
+        run: |
+          UP="${{ steps.upstream.outputs.version_date }}"
+          FK="${{ steps.fork.outputs.version_date }}"
+
+          if [ "$UP" = "$FK" ]; then
+            echo "✅ Уже на актуальной версии ($UP). Пропускаем."
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+          else
+            echo "🔄 Новая версия: $FK → $UP"
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ── 4. Checkout ───────────────────────────────────────────────────────
+      # ВАЖНО: persist-credentials: false — иначе actions/checkout пропишет
+      # extraheader с GITHUB_TOKEN, который перебьёт PAT_TOKEN при пуше на шаге 8
+      # (extraheader в git config имеет приоритет над credentials в URL remote).
+      - name: Checkout fork
+        if: steps.compare.outputs.needs_sync == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+
+      # ── 5. Синхронизация с upstream ───────────────────────────────────────
+      - name: Fetch & reset to upstream
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Сохраняем SHA до reset явно — не полагаемся на HEAD@{1} из reflog,
+          # так как порядок/наличие reflog-записей может измениться при
+          # будущих правках workflow и молча сломать восстановление файлов ниже.
+          echo "ORIGINAL_SHA=$(git rev-parse HEAD)" >> $GITHUB_ENV
+
+          git remote add upstream "https://github.com/${{ env.UPSTREAM }}.git"
+          git fetch upstream ${{ env.BRANCH }}
+          git reset --hard upstream/${{ env.BRANCH }}
+
+      # ════════════════════════════════════════════════════════════════════
+      #  🛡️ БЛОК ВОССТАНОВЛЕНИЯ КАСТОМНЫХ ФАЙЛОВ
+      #  ⚠️ Важно: НЕ восстанавливаем build.yml — оставляем новый!
+      # ════════════════════════════════════════════════════════════════════
+
+      # ── 6. Восстанавливаем кастомные файлы после reset ────────────────────
+      - name: Restore custom files (keep new build.yml!)
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          echo "♻️ Восстанавливаем кастомные файлы из ${ORIGINAL_SHA}..."
+
+          # ⚠️ ВАЖНО: НЕ восстанавливаем build.yml
+
+          # 1. sync-upstream.yml (сам workflow синхронизации)
+          git checkout "$ORIGINAL_SHA" -- .github/workflows/sync-upstream.yml 2>/dev/null \
+            && echo "✅ sync-upstream.yml восстановлен" \
+            || echo "⚠️ sync-upstream.yml не найден"
+
+          # 2. dll/ (Goldberg Steam Emulator) — КРИТИЧНО!
+          git checkout "$ORIGINAL_SHA" -- dll/ 2>/dev/null \
+            && echo "✅ dll/ восстановлен (Goldberg DLL)" \
+            || echo "❌ dll/ НЕ найден! Онлайн не будет работать!"
+
+          # 3. gen_manifest.py (генератор manifest.json для лаунчера)
+          git checkout "$ORIGINAL_SHA" -- gen_manifest.py 2>/dev/null \
+            && echo "✅ gen_manifest.py восстановлен" \
+            || echo "⚠️ gen_manifest.py не найден"
+
+          # 4. Другие опциональные файлы (если есть в репозитории)
+          git checkout "$ORIGINAL_SHA" -- STEAM_SETTINGS_GUIDE.md 2>/dev/null || true
+          git checkout "$ORIGINAL_SHA" -- README.md 2>/dev/null || true
+
+          echo ""
+          echo "╔══════════════════════════════════════════╗"
+          echo "║  📋 Итого восстановлено:                 ║"
+          echo "╠══════════════════════════════════════════╣"
+          echo "║  ✅ .github/workflows/sync-upstream.yml  ║"
+          echo "║  ✅ dll/                                 ║"
+          echo "║  ✅ gen_manifest.py                      ║"
+          echo "║  🎮 build.yml = ОСТАЁТСЯ НОВЫЙ           ║"
+          echo "║                                          ║"
+          echo "╚══════════════════════════════════════════╝"
+
+      # ── 7. Пишем маркер версии и коммитим ────────────────────────────────
+      - name: Write sync marker & commit
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          echo "${{ steps.upstream.outputs.version_date }}" > .last-sync-version
+          git add -f .last-sync-version
+          git add -A
+
+          # Если после reset + восстановления кастомных файлов реальных
+          # изменений не оказалось (редкий edge-case), обычный commit упал бы
+          # с "nothing to commit" и уронил весь job — используем --allow-empty.
+          if git diff --cached --quiet; then
+            echo "ℹ️ Нет изменений файлов, коммитим только маркер версии (allow-empty)"
+            git commit --allow-empty -m "chore: sync to upstream ${{ steps.upstream.outputs.version_date }} [${{ steps.upstream.outputs.sha }}] (no file changes)"
+          else
+            git commit -m "chore: sync to upstream ${{ steps.upstream.outputs.version_date }} [${{ steps.upstream.outputs.sha }}]
+
+          🤖 Auto-sync from Facepunch/sbox-public
+          📦 Custom files restored: dll/, gen_manifest.py, sync-upstream.yml
+          🎮 build.yml kept: Spacewar Online edition (AppID 480)"
+          fi
+
+      # ── 8. Push через PAT_TOKEN (обход ограничения workflow files) ────────
+      - name: Push to fork via PAT_TOKEN
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          # Используем PAT_TOKEN для обхода ограничения на пуш workflow файлов.
+          # Работает корректно только благодаря persist-credentials: false на шаге 4 —
+          # иначе extraheader от GITHUB_TOKEN перебил бы этот токен.
+          git remote set-url origin "https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push origin refs/heads/${{ env.BRANCH }} --force-with-lease
+
+      # ── 9. Создаём тег ────────────────────────────────────────────────────
+      - name: Tag the sync
+        id: tag_sync
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          VER="${{ steps.upstream.outputs.version_date }}"
+          SHA="${{ steps.upstream.outputs.sha }}"
+          BASE_TAG="v${VER}"
+
+          # Если тег уже существует — добавляем счётчик
+          git fetch --tags
+          N=1
+          TAG="${BASE_TAG}"
+          while git rev-parse "$TAG" >/dev/null 2>&1; do
+            N=$((N+1))
+            TAG="${BASE_TAG}-r${N}"
+          done
+
+          git tag "$TAG"
+          git push origin "$TAG"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "🏷️  Тег создан: $TAG"
+
+      # ── 10. Запускаем build.yml вручную через API ────────────────────────
+      - name: Trigger build workflow
+        if: steps.compare.outputs.needs_sync == 'true'
+        run: |
+          TAG="${{ steps.tag_sync.outputs.tag }}"
+          # Если тег не создался — используем ветку master
+          if [ -z "$TAG" ]; then TAG="master"; fi
+
+          # Формируем JSON отдельно чтобы избежать проблем с кавычками
+          JSON_BODY="{\"ref\":\"${TAG}\"}"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            -H "Authorization: Bearer ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
+            -d "$JSON_BODY")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          if [ "$HTTP_CODE" = "204" ]; then
+            echo "✅ build.yml успешно запущен для тега $TAG (HTTP $HTTP_CODE)"
+            echo "🎮 Сборка будет включать  онлайн"
+          else
+            echo "❌ Не удалось запустить build.yml (HTTP $HTTP_CODE)"
+            echo "Ответ API: $BODY"
+            echo "Проверь что PAT_TOKEN добавлен в секреты репо и имеет scope 'workflow'"
+          fi
+
+      # ── 11. Summary ───────────────────────────────────────────────────────
+      - name: Job summary
+        run: |
+          if [ "${{ steps.compare.outputs.needs_sync }}" = "true" ]; then
+            echo "### 🚀 Синхронизировано: \`${{ steps.upstream.outputs.version_date }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "**SHA:** \`${{ steps.upstream.outputs.sha }}\`"                          >> $GITHUB_STEP_SUMMARY
+            echo "**Коммит:** ${{ steps.upstream.outputs.message }}"                       >> $GITHUB_STEP_SUMMARY
+            echo ""                                                                            >> $GITHUB_STEP_SUMMARY
+            echo "**Восстановленные файлы:**"                                                  >> $GITHUB_STEP_SUMMARY
+            echo "- \`gen_manifest.py\`"                                                        >> $GITHUB_STEP_SUMMARY
+            echo "- \`sync-upstream.yml\`"                                                      >> $GITHUB_STEP_SUMMARY
+            echo "- \`build.yml\` = **НОВЫЙ** (Online 🎮)"                                      >> $GITHUB_STEP_SUMMARY
+            echo ""                                                                            >> $GITHUB_STEP_SUMMARY
+            echo "**Тег для сборки:** \`${{ steps.tag_sync.outputs.tag }}\`"                   >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ Форк актуален — \`${{ steps.upstream.outputs.version_date }}\`"  >> $GITHUB_STEP_SUMMARY
+            echo "Синхронизация не требуется."                                               >> $GITHUB_STEP_SUMMARY
+          fi
