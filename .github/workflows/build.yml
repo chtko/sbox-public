@@ -1,0 +1,381 @@
+name: Build & Release s&box
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  workflow_dispatch:
+    inputs:
+      debug_build:
+        description: 'Debug сборка (с логами)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: "10.x"
+  PYTHON_VERSION: "3.12"
+  # Добавлены переменные для онлайна
+  STEAM_APP_ID: "480"
+  GAME_NAME: "S&box Community"
+
+jobs:
+  build:
+    name: Compile Engine
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      # --------------------------------------------------
+      # Checkout
+      # --------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # --------------------------------------------------
+      # Toolchains
+      # --------------------------------------------------
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # --------------------------------------------------
+      # Cache
+      # --------------------------------------------------
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps
+          key: deps-${{ runner.os }}-${{ hashFiles('Bootstrap.bat', '**/*.json') }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      # --------------------------------------------------
+      # Build
+      # --------------------------------------------------
+      - name: Run Bootstrap
+        shell: cmd
+        env:
+          CI: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          call Bootstrap.bat
+
+      - name: Validate build output
+        shell: pwsh
+        run: |
+          $required = @(
+            "game",
+            "game\bin",
+            "game\bin\win64"
+          )
+          foreach ($path in $required) {
+            if (!(Test-Path $path)) {
+              Write-Error "Missing build output: $path"
+              exit 1
+            }
+          }
+          Write-Host "Build output OK"
+
+      # ════════════════════════════════════════════════════════════════════
+      #  🎯 БЛОК ПАТЧЕЙ И НАСТРОЙКИ ОНЛАЙНА (Вставлено отсюда)
+      # ════════════════════════════════════════════════════════════════════
+
+      - name: Patch engine2.dll (Remove Steam checks)
+        shell: pwsh
+        run: |
+          Write-Host "🔧 Патчим engine2.dll..."
+          
+          $win64 = "game\bin\win64"
+          $dll = "$win64\engine2.dll"
+          
+          if (-not (Test-Path $dll)) {
+            Write-Error "engine2.dll не найден!"
+            exit 1
+          }
+          
+          $bytes = [System.IO.File]::ReadAllBytes($dll)
+          $patched = $false
+          
+          # Патчи: NOP'аем conditional jumps на unconditional
+          $patches = @(
+            @{
+              off = 0x30E2E4
+              src = [byte[]](0x0F, 0x84, 0xC4, 0x00, 0x00, 0x00)
+              dst = [byte[]](0x90, 0x90, 0x90, 0x90, 0x90, 0x90)
+              name = "SteamClient null check"
+            },
+            @{
+              off = 0x30E2FA
+              src = [byte[]](0x0F, 0x84, 0xAE, 0x00, 0x00, 0x00)
+              dst = [byte[]](0x90, 0x90, 0x90, 0x90, 0x90, 0x90)
+              name = "SteamUser null check"
+            }
+          )
+          
+          foreach ($p in $patches) {
+            $found = $bytes[$p.off..($p.off + 5)]
+            $foundStr = ($found -join ",")
+            $srcStr = ($p.src -join ",")
+            $dstStr = ($p.dst -join ",")
+            
+            if ($foundStr -eq $srcStr) {
+              [System.Array]::Copy($p.dst, 0, $bytes, $p.off, 6)
+              Write-Host "✅ Пропатчено: $($p.name)"
+              $patched = $true
+            } elseif ($foundStr -eq $dstStr) {
+              Write-Host "⏭️ Уже пропатчено: $($p.name)"
+            } else {
+              Write-Warning "⚠️ Не совпало ($($p.name))!"
+              Write-Warning "   Возможно версия DLL изменилась?"
+            }
+          }
+          
+          [System.IO.File]::WriteAllBytes($dll, $bytes)
+          Write-Host "📦 engine2.dll сохранён"
+
+      - name: Replace steam_api64.dll with Goldberg
+        shell: pwsh
+        run: |
+          Write-Host "🎮 Устанавливаем Goldberg Steam Emulator..."
+          
+          $win64 = "game\bin\win64"
+          $ourDll = Join-Path $env:GITHUB_WORKSPACE "dll\steam_api64.dll"
+          
+          if (-not (Test-Path $ourDll)) {
+            Write-Error "❌ dll/steam_api64.dll не найден в репозитории!"
+            exit 1
+          }
+          
+          # Копируем наш Goldberg DLL
+          Copy-Item $ourDll "$win64\steam_api64.dll" -Force
+          Write-Host "✅ steam_api64.dll заменён на Goldberg версию"
+
+      - name: Create steam_appid.txt (AppID)
+        shell: pwsh
+        run: |
+          Write-Host "🎯 Настраиваем AppID..."
+          
+          $win64 = "game\bin\win64"
+          Set-Content "$win64\steam_appid.txt" "${{ env.STEAM_APP_ID }}"
+          Write-Host "✅ steam_appid.txt создан: AppID = ${{ env.STEAM_APP_ID }}"
+
+      - name: Create steam_settings for Global Online
+        shell: pwsh
+        run: |
+          Write-Host "🌐 Настраиваем глобальный онлайн..."
+          
+          $win64 = "game\bin\win64"
+          $settingsDir = "$win64\steam_settings"
+          
+          # Создаём папку steam_settings
+          New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+          
+          # account_name.txt
+          Set-Content "$settingsDir\account_name.txt" "SBoxPlayer"
+          
+          # user_token.txt
+          $token = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
+          Set-Content "$settingsDir\user_token.txt" $token
+          
+          # offline.ini
+          @'
+          [Steam]
+          AppId=480
+          GameName=${{ env.GAME_NAME }}
+
+          [Network]
+          EnablePublicIP=true
+          UseSteamNetworking=true
+
+          [Lobby]
+          BrowserType=all
+          MaxLobbies=1000
+
+          [Account]
+          OfflineAccount=true
+          '@ | Set-Content "$settingsDir\offline.ini"
+          
+          # override_appid.txt
+          Set-Content "$settingsDir\override_appid.txt" "${{ env.STEAM_APP_ID }}"
+          
+          # language.txt
+          Set-Content "$settingsDir\language.txt" "russian"
+          
+          Write-Host "🎮 Глобальный онлайн настроен!"
+
+      - name: Create ONLINE_README.txt
+        shell: pwsh
+        run: |
+          $readme = @"
+          ╔═══════════════════════════════════════════════════════════════════╗
+          ║           S&box Community Edition — Глобальный Онлайн             ║
+          ╠═══════════════════════════════════════════════════════════════════╣
+          ║                                                                   ║
+          ║  🎮 Эта сборка включает:                                          ║
+          ║     • Онлайн                                                      ║
+          ║     • Глобальный поиск игр через мастер-серверы                   ║
+          ║                                                                   ║
+          ╠═══════════════════════════════════════════════════════════════════╣
+          ║  📖 КАК ИГРАТЬ ОНЛАЙН:                                            ║
+          ╠═══════════════════════════════════════════════════════════════════╣
+          ║                                                                   ║
+          ║  1. ЗАПУСК:                                                       ║
+          ║     • Запустите sbox.exe                                          ║
+          ║     • Игра автоматически подключится к сети                       ║
+          ║                                                                   ║
+          ║  2. СМЕНИТЬ НИК (опционально):                                    ║
+          ║     • Откройте game/bin/win64/steam_settings/account_name.txt     ║
+          ║     • Впишите свой ник                                            ║
+          ║                                                                   ║
+          ║  3. ПОДКЛЮЧЕНИЕ К ИГРЕ:                                           ║
+          ║     • В игре выберите "Мультиплеер" или "Сеть"                    ║
+          ║     • Подключайтесь к любому доступному серверу                   ║
+          ║                                                                   ║
+          ╚═══════════════════════════════════════════════════════════════════╝
+          "@
+          $readme | Out-File -FilePath "game\bin\win64\ONLINE_README.txt" -Encoding UTF8
+          Write-Host "📄 ONLINE_README.txt создан"
+
+      # ════════════════════════════════════════════════════════════════════
+      #  Конец блока патчей
+      # ════════════════════════════════════════════════════════════════════
+
+      # --------------------------------------------------
+      # Generate documentation
+      # --------------------------------------------------
+      - name: Create build info
+        shell: pwsh
+        run: |
+          $info = @"
+          Build:
+          ${{ github.sha }}
+
+          Branch:
+          ${{ github.ref }}
+
+          Date:
+          $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          "@
+          $info | Out-File `
+            game\bin\win64\BUILD_INFO.txt `
+            -Encoding UTF8
+
+      # --------------------------------------------------
+      # Manifest
+      # --------------------------------------------------
+      - name: Generate manifest
+        shell: pwsh
+        run: |
+          if (Test-Path "gen_manifest.py") {
+            python gen_manifest.py game "${{ github.ref_name }}" > manifest.json
+            if (!(Test-Path manifest.json)) {
+              Write-Error "manifest.json generation failed"
+              exit 1
+            }
+            Write-Host "Manifest created"
+          }
+          else {
+            Write-Warning "gen_manifest.py not found"
+          }
+
+      # --------------------------------------------------
+      # Package
+      # --------------------------------------------------
+      - name: Install 7-Zip
+        shell: pwsh
+        run: |
+          if (!(Get-Command 7z -ErrorAction SilentlyContinue)) {
+            choco install 7zip -y
+          }
+
+      - name: Package build
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ([string]::IsNullOrEmpty($tag)) {
+            $tag = "manual"
+          }
+          $archive = "sbox-$tag.7z"
+          7z a `
+            -t7z `
+            -mx=9 `
+            -mmt=on `
+            -v2000m `
+            $archive `
+            game\*
+          $files = Get-ChildItem "$archive.*"
+          if (!$files) {
+            Write-Error "Archive was not created"
+            exit 1
+          }
+          Write-Host "Created archives:"
+          $files | ForEach-Object {
+            Write-Host $_.Name
+          }
+
+      # --------------------------------------------------
+      # Debug logs
+      # --------------------------------------------------
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            **/*.log
+            **/*.binlog
+          retention-days: 7
+
+      # --------------------------------------------------
+      # Release
+      # --------------------------------------------------
+      - name: Create GitHub Release
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: s&box Build ${{ github.ref_name }}
+          body: |
+            ## s&box Build
+
+            Автоматическая сборка.
+
+            Commit:
+            `${{ github.sha }}`
+
+            Включает:
+
+            - Source build
+            - Generated manifest
+            - Packaged archive
+          files: |
+            sbox-${{ github.ref_name }}.7z.*
+            manifest.json
+          fail_on_unmatched_files: false
