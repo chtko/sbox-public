@@ -104,13 +104,13 @@ jobs:
           Write-Host "Build output OK"
 
       # ════════════════════════════════════════════════════════════════════
-      #  🎯 БЛОК ПАТЧЕЙ И НАСТРОЙКИ ОНЛАЙНА (Вставлено отсюда)
+      #  🎯 БЛОК ПАТЧЕЙ И НАСТРОЙКИ ОНЛАЙНА
       # ════════════════════════════════════════════════════════════════════
 
       - name: Patch engine2.dll (Remove Steam checks)
         shell: pwsh
         run: |
-          Write-Host "🔧 Патчим engine2.dll..."
+          Write-Host "🔧 Патчим engine2.dll (Динамический поиск байтов)..."
           
           $win64 = "game\bin\win64"
           $dll = "$win64\engine2.dll"
@@ -121,39 +121,53 @@ jobs:
           }
           
           $bytes = [System.IO.File]::ReadAllBytes($dll)
-          $patched = $false
           
-          # Патчи: NOP'аем conditional jumps на unconditional
+          # Патчи: Ищем сигнатуру по всему файлу, а не по жесткому оффсету
           $patches = @(
             @{
-              off = 0x30E2E4
-              src = [byte[]](0x0F, 0x84, 0xC4, 0x00, 0x00, 0x00)
+              pattern = [byte[]](0x0F, 0x84, 0xC4, 0x00, 0x00, 0x00)
               dst = [byte[]](0x90, 0x90, 0x90, 0x90, 0x90, 0x90)
               name = "SteamClient null check"
             },
             @{
-              off = 0x30E2FA
-              src = [byte[]](0x0F, 0x84, 0xAE, 0x00, 0x00, 0x00)
+              pattern = [byte[]](0x0F, 0x84, 0xAE, 0x00, 0x00, 0x00)
               dst = [byte[]](0x90, 0x90, 0x90, 0x90, 0x90, 0x90)
               name = "SteamUser null check"
             }
           )
           
           foreach ($p in $patches) {
-            $found = $bytes[$p.off..($p.off + 5)]
-            $foundStr = ($found -join ",")
-            $srcStr = ($p.src -join ",")
-            $dstStr = ($p.dst -join ",")
+            $found = $false
+            # Ищем сигнатуру в массиве байтов
+            for ($i = 0; $i -lt $bytes.Length - 6; $i++) {
+                if ($bytes[$i] -eq $p.pattern[0] -and $bytes[$i+1] -eq $p.pattern[1]) {
+                    $match = $true
+                    for ($j = 2; $j -lt $p.pattern.Length; $j++) {
+                        if ($bytes[$i+$j] -ne $p.pattern[$j]) { $match = $false; break }
+                    }
+                    if ($match) {
+                        # Нашли! Меняем байты на NOP (0x90)
+                        [System.Array]::Copy($p.dst, 0, $bytes, $i, 6)
+                        Write-Host "✅ Пропатчено: $($p.name) по адресу 0x$($i.ToString('X'))"
+                        $found = $true
+                        break # Выходим из цикла поиска, так как патч применен
+                    }
+                }
+            }
             
-            if ($foundStr -eq $srcStr) {
-              [System.Array]::Copy($p.dst, 0, $bytes, $p.off, 6)
-              Write-Host "✅ Пропатчено: $($p.name)"
-              $patched = $true
-            } elseif ($foundStr -eq $dstStr) {
-              Write-Host "⏭️ Уже пропатчено: $($p.name)"
-            } else {
-              Write-Warning "⚠️ Не совпало ($($p.name))!"
-              Write-Warning "   Возможно версия DLL изменилась?"
+            if (-not $found) {
+                # Если байты уже 0x90, значет уже пропатчено
+                $alreadyPatched = $false
+                for ($i = 0; $i -lt $bytes.Length - 6; $i++) {
+                    if ($bytes[$i] -eq $p.dst[0] -and $bytes[$i+1] -eq $p.dst[1] -and $bytes[$i+2] -eq $p.dst[2]) {
+                        $alreadyPatched = $true; break
+                    }
+                }
+                if ($alreadyPatched) {
+                    Write-Host "⏭️ Уже пропатчено: $($p.name)"
+                } else {
+                    Write-Warning "⚠️ Не совпало ($($p.name))! Сигнатура не найдена в DLL."
+                }
             }
           }
           
@@ -173,7 +187,6 @@ jobs:
             exit 1
           }
           
-          # Копируем наш Goldberg DLL
           Copy-Item $ourDll "$win64\steam_api64.dll" -Force
           Write-Host "✅ steam_api64.dll заменён на Goldberg версию"
 
@@ -181,7 +194,6 @@ jobs:
         shell: pwsh
         run: |
           Write-Host "🎯 Настраиваем AppID..."
-          
           $win64 = "game\bin\win64"
           Set-Content "$win64\steam_appid.txt" "${{ env.STEAM_APP_ID }}"
           Write-Host "✅ steam_appid.txt создан: AppID = ${{ env.STEAM_APP_ID }}"
@@ -189,12 +201,11 @@ jobs:
       - name: Create steam_settings for Global Online
         shell: pwsh
         run: |
-          Write-Host "🌐 Настраиваем глобальный онлайн..."
+          Write-Host "🌐 Настраиваем глобальный онлайн и интерфейсы..."
           
           $win64 = "game\bin\win64"
           $settingsDir = "$win64\steam_settings"
           
-          # Создаём папку steam_settings
           New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
           
           # account_name.txt
@@ -204,29 +215,45 @@ jobs:
           $token = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
           Set-Content "$settingsDir\user_token.txt" $token
           
-          # offline.ini
-          @'
-          [Steam]
-          AppId=480
-          GameName=${{ env.GAME_NAME }}
-
-          [Network]
-          EnablePublicIP=true
-          UseSteamNetworking=true
-
-          [Lobby]
-          BrowserType=all
-          MaxLobbies=1000
-
-          [Account]
-          OfflineAccount=true
-          '@ | Set-Content "$settingsDir\offline.ini"
+          # app_name.txt (вместо offline.ini)
+          Set-Content "$settingsDir\app_name.txt" "${{ env.GAME_NAME }}"
           
           # override_appid.txt
           Set-Content "$settingsDir\override_appid.txt" "${{ env.STEAM_APP_ID }}"
           
           # language.txt
           Set-Content "$settingsDir\language.txt" "russian"
+          
+          # 🚨 КРИТИЧЕСКИ ВАЖНО: steam_interfaces.txt
+          # Фиксит ошибку INTERFACE=STEAMAPPS INTERFACE VERSION009
+          $interfaces = @"
+          SteamClient017
+          SteamUser019
+          SteamFriends015
+          SteamApps009
+          SteamNetworking006
+          SteamMatchMaking006
+          SteamMatchMakingServers004
+          SteamMatchMakingKeyValuePair001
+          SteamGameServerStats001
+          SteamGameServer012
+          SteamHTTP003
+          SteamController008
+          SteamUGC016
+          SteamAppList001
+          SteamMusic001
+          SteamMusicRemote001
+          SteamHTMLSurface005
+          SteamInventory003
+          SteamVideo002
+          SteamParentalSettings001
+          SteamNetworkingUtils003
+          "@
+          Set-Content "$settingsDir\steam_interfaces.txt" $interfaces
+          Write-Host "✅ steam_interfaces.txt создан (включая SteamApps009)"
+          
+          # connect_string.txt
+          Set-Content "$settingsDir\connect_string.txt" "connect <IP:PORT>"
           
           Write-Host "🎮 Глобальный онлайн настроен!"
 
