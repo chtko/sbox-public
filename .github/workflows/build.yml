@@ -23,7 +23,6 @@ concurrency:
 env:
   DOTNET_VERSION: "10.x"
   PYTHON_VERSION: "3.12"
-  # Добавлены переменные для онлайна
   STEAM_APP_ID: "480"
   GAME_NAME: "S&box Community"
 
@@ -42,6 +41,37 @@ jobs:
         with:
           fetch-depth: 0
           submodules: recursive
+
+      # --------------------------------------------------
+      # Тег релиза
+      #   ручной запуск -> vГГ.ММ.ДД (например v26.07.22)
+      #   повтор в тот же день -> v26.07.22-1435
+      #   пуш тега v*    -> используем сам тег
+      # --------------------------------------------------
+      - name: Compute release tag
+        id: reltag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ("${{ github.event_name }}" -eq "push") {
+            $tag = "${{ github.ref_name }}"
+          }
+          else {
+            $tag = "v$(Get-Date -Format 'yy.MM.dd')"
+
+            $names = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" --jq ".[].tag_name"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Не удалось получить список релизов"
+              exit 1
+            }
+            if (@($names) -contains $tag) {
+              $tag = "$tag-$(Get-Date -Format 'HHmm')"
+              Write-Host "Релиз за сегодня уже есть, добавляю время: $tag"
+            }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Release tag: $tag"
 
       # --------------------------------------------------
       # Toolchains
@@ -67,12 +97,13 @@ jobs:
           restore-keys: |
             nuget-${{ runner.os }}-
 
+      # Ключ только по Bootstrap.bat — раньше '**/*.json'
+      # инвалидировал кэш любым json'ом в репо
       - name: Cache dependencies
         uses: actions/cache@v4
         with:
-          path: |
-            deps
-          key: deps-${{ runner.os }}-${{ hashFiles('Bootstrap.bat', '**/*.json') }}
+          path: deps
+          key: deps-${{ runner.os }}-${{ hashFiles('Bootstrap.bat') }}
           restore-keys: |
             deps-${{ runner.os }}-
 
@@ -84,17 +115,14 @@ jobs:
         env:
           CI: true
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEBUG_BUILD: ${{ inputs.debug_build }}
         run: |
           call Bootstrap.bat
 
       - name: Validate build output
         shell: pwsh
         run: |
-          $required = @(
-            "game",
-            "game\bin",
-            "game\bin\win64"
-          )
+          $required = @("game", "game\bin", "game\bin\win64")
           foreach ($path in $required) {
             if (!(Test-Path $path)) {
               Write-Error "Missing build output: $path"
@@ -104,128 +132,51 @@ jobs:
           Write-Host "Build output OK"
 
       # ════════════════════════════════════════════════════════════════════
-      #  🎯 БЛОК ПАТЧЕЙ И НАСТРОЙКИ ОНЛАЙНА
+      #  🎯 БЛОК НАСТРОЙКИ ОНЛАЙНА
+      #  (патчинг engine2.dll убран — достаточно замены DLL)
       # ════════════════════════════════════════════════════════════════════
-
-      - name: Patch engine2.dll (Remove Steam checks)
-        shell: pwsh
-        run: |
-          Write-Host "🔧 Патчим engine2.dll (Динамический поиск байтов)..."
-          
-          $win64 = "game\bin\win64"
-          $dll = "$win64\engine2.dll"
-          
-          if (-not (Test-Path $dll)) {
-            Write-Error "engine2.dll не найден!"
-            exit 1
-          }
-          
-          $bytes = [System.IO.File]::ReadAllBytes($dll)
-          
-          # Патчи: Ищем сигнатуру по всему файлу, а не по жесткому оффсету
-          $patches = @(
-            @{
-              pattern = [byte[]](0x0F, 0x84, 0xC4, 0x00, 0x00, 0x00)
-              dst = [byte[]](0x90, 0x90, 0x90, 0x90, 0x90, 0x90)
-              name = "SteamClient null check"
-            },
-            @{
-              pattern = [byte[]](0x0F, 0x84, 0xAE, 0x00, 0x00, 0x00)
-              dst = [byte[]](0x90, 0x90, 0x90, 0x90, 0x90, 0x90)
-              name = "SteamUser null check"
-            }
-          )
-          
-          foreach ($p in $patches) {
-            $found = $false
-            # Ищем сигнатуру в массиве байтов
-            for ($i = 0; $i -lt $bytes.Length - 6; $i++) {
-                if ($bytes[$i] -eq $p.pattern[0] -and $bytes[$i+1] -eq $p.pattern[1]) {
-                    $match = $true
-                    for ($j = 2; $j -lt $p.pattern.Length; $j++) {
-                        if ($bytes[$i+$j] -ne $p.pattern[$j]) { $match = $false; break }
-                    }
-                    if ($match) {
-                        # Нашли! Меняем байты на NOP (0x90)
-                        [System.Array]::Copy($p.dst, 0, $bytes, $i, 6)
-                        Write-Host "✅ Пропатчено: $($p.name) по адресу 0x$($i.ToString('X'))"
-                        $found = $true
-                        break # Выходим из цикла поиска, так как патч применен
-                    }
-                }
-            }
-            
-            if (-not $found) {
-                # Если байты уже 0x90, значет уже пропатчено
-                $alreadyPatched = $false
-                for ($i = 0; $i -lt $bytes.Length - 6; $i++) {
-                    if ($bytes[$i] -eq $p.dst[0] -and $bytes[$i+1] -eq $p.dst[1] -and $bytes[$i+2] -eq $p.dst[2]) {
-                        $alreadyPatched = $true; break
-                    }
-                }
-                if ($alreadyPatched) {
-                    Write-Host "⏭️ Уже пропатчено: $($p.name)"
-                } else {
-                    Write-Warning "⚠️ Не совпало ($($p.name))! Сигнатура не найдена в DLL."
-                }
-            }
-          }
-          
-          [System.IO.File]::WriteAllBytes($dll, $bytes)
-          Write-Host "📦 engine2.dll сохранён"
 
       - name: Replace steam_api64.dll with Goldberg
         shell: pwsh
         run: |
           Write-Host "🎮 Устанавливаем Goldberg Steam Emulator..."
-          
+
           $win64 = "game\bin\win64"
           $ourDll = Join-Path $env:GITHUB_WORKSPACE "dll\steam_api64.dll"
-          
+
           if (-not (Test-Path $ourDll)) {
             Write-Error "❌ dll/steam_api64.dll не найден в репозитории!"
             exit 1
           }
-          
+
           Copy-Item $ourDll "$win64\steam_api64.dll" -Force
           Write-Host "✅ steam_api64.dll заменён на Goldberg версию"
 
       - name: Create steam_appid.txt (AppID)
         shell: pwsh
         run: |
-          Write-Host "🎯 Настраиваем AppID..."
           $win64 = "game\bin\win64"
           Set-Content "$win64\steam_appid.txt" "${{ env.STEAM_APP_ID }}"
-          Write-Host "✅ steam_appid.txt создан: AppID = ${{ env.STEAM_APP_ID }}"
+          Write-Host "✅ steam_appid.txt: AppID = ${{ env.STEAM_APP_ID }}"
 
-      - name: Create steam_settings for Global Online
+      - name: Create steam_settings
         shell: pwsh
         run: |
-          Write-Host "🌐 Настраиваем глобальный онлайн и интерфейсы..."
-          
-          $win64 = "game\bin\win64"
-          $settingsDir = "$win64\steam_settings"
-          
+          Write-Host "🌐 Настраиваем steam_settings..."
+
+          $settingsDir = "game\bin\win64\steam_settings"
           New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
-          
-          # account_name.txt
+
           Set-Content "$settingsDir\account_name.txt" "SBoxPlayer"
-          
-          # user_token.txt
+
           $token = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
           Set-Content "$settingsDir\user_token.txt" $token
-          
-          # app_name.txt (вместо offline.ini)
+
           Set-Content "$settingsDir\app_name.txt" "${{ env.GAME_NAME }}"
-          
-          # override_appid.txt
           Set-Content "$settingsDir\override_appid.txt" "${{ env.STEAM_APP_ID }}"
-          
-          # language.txt
           Set-Content "$settingsDir\language.txt" "russian"
-          
-          # 🚨 КРИТИЧЕСКИ ВАЖНО: steam_interfaces.txt
-          # Фиксит ошибку INTERFACE=STEAMAPPS INTERFACE VERSION009
+
+          # steam_interfaces.txt (фикс INTERFACE=STEAMAPPS INTERFACE VERSION009)
           $interfaces = @"
           SteamClient017
           SteamUser019
@@ -250,12 +201,10 @@ jobs:
           SteamNetworkingUtils003
           "@
           Set-Content "$settingsDir\steam_interfaces.txt" $interfaces
-          Write-Host "✅ steam_interfaces.txt создан (включая SteamApps009)"
-          
-          # connect_string.txt
+          Write-Host "✅ steam_interfaces.txt (включая SteamApps009)"
+
           Set-Content "$settingsDir\connect_string.txt" "connect <IP:PORT>"
-          
-          Write-Host "🎮 Глобальный онлайн настроен!"
+          Write-Host "🎮 steam_settings готов"
 
       - name: Create ONLINE_README.txt
         shell: pwsh
@@ -270,15 +219,15 @@ jobs:
           ║     • Глобальный поиск игр через мастер-серверы                   ║
           ║                                                                   ║
           ╠═══════════════════════════════════════════════════════════════════╣
-          ║  📖 КАК ИГРАТЬ ОНЛАЙН:                                            ║
+          ║  📖 КАК ИГРАТЬ ОНЛАЙН:                                           ║
           ╠═══════════════════════════════════════════════════════════════════╣
           ║                                                                   ║
           ║  1. ЗАПУСК:                                                       ║
-          ║     • Запустите sbox.exe                                          ║
+          ║     • Запустите game\bin\win64\sbox.exe                           ║
           ║     • Игра автоматически подключится к сети                       ║
           ║                                                                   ║
           ║  2. СМЕНИТЬ НИК (опционально):                                    ║
-          ║     • Откройте game/bin/win64/steam_settings/account_name.txt     ║
+          ║     • Откройте game\bin\win64\steam_settings\account_name.txt     ║
           ║     • Впишите свой ник                                            ║
           ║                                                                   ║
           ║  3. ПОДКЛЮЧЕНИЕ К ИГРЕ:                                           ║
@@ -290,29 +239,19 @@ jobs:
           $readme | Out-File -FilePath "game\bin\win64\ONLINE_README.txt" -Encoding UTF8
           Write-Host "📄 ONLINE_README.txt создан"
 
-      # ════════════════════════════════════════════════════════════════════
-      #  Конец блока патчей
-      # ════════════════════════════════════════════════════════════════════
-
       # --------------------------------------------------
-      # Generate documentation
+      # Documentation
       # --------------------------------------------------
       - name: Create build info
         shell: pwsh
         run: |
           $info = @"
-          Build:
-          ${{ github.sha }}
-
-          Branch:
-          ${{ github.ref }}
-
-          Date:
-          $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          Build: ${{ github.sha }}
+          Branch: ${{ github.ref }}
+          Tag: ${{ steps.reltag.outputs.tag }}
+          Date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
           "@
-          $info | Out-File `
-            game\bin\win64\BUILD_INFO.txt `
-            -Encoding UTF8
+          $info | Out-File -FilePath "game\bin\win64\BUILD_INFO.txt" -Encoding UTF8
 
       # --------------------------------------------------
       # Manifest
@@ -320,17 +259,16 @@ jobs:
       - name: Generate manifest
         shell: pwsh
         run: |
-          if (Test-Path "gen_manifest.py") {
-            python gen_manifest.py game "${{ github.ref_name }}" > manifest.json
-            if (!(Test-Path manifest.json)) {
-              Write-Error "manifest.json generation failed"
-              exit 1
-            }
-            Write-Host "Manifest created"
+          if (!(Test-Path "gen_manifest.py")) {
+            Write-Error "gen_manifest.py не найден — манифест обязателен для релиза"
+            exit 1
           }
-          else {
-            Write-Warning "gen_manifest.py not found"
+          python gen_manifest.py game "${{ steps.reltag.outputs.tag }}" > manifest.json
+          if (!(Test-Path manifest.json) -or (Get-Item manifest.json).Length -eq 0) {
+            Write-Error "manifest.json не создан или пуст"
+            exit 1
           }
+          Write-Host "Manifest created"
 
       # --------------------------------------------------
       # Package
@@ -345,30 +283,20 @@ jobs:
       - name: Package build
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
-          if ([string]::IsNullOrEmpty($tag)) {
-            $tag = "manual"
-          }
+          $tag = "${{ steps.reltag.outputs.tag }}"
           $archive = "sbox-$tag.7z"
-          7z a `
-            -t7z `
-            -mx=9 `
-            -mmt=on `
-            -v2000m `
-            $archive `
-            game\*
-          $files = Get-ChildItem "$archive.*"
-          if (!$files) {
+          # Пакуем папку game целиком, чтобы пути из ONLINE_README
+          # совпадали со структурой распакованного архива
+          7z a -t7z -mx=9 -mmt=on -v2000m $archive game
+          if (!(Get-ChildItem "$archive.*" -ErrorAction SilentlyContinue)) {
             Write-Error "Archive was not created"
             exit 1
           }
           Write-Host "Created archives:"
-          $files | ForEach-Object {
-            Write-Host $_.Name
-          }
+          Get-ChildItem "$archive.*" | ForEach-Object { Write-Host $_.Name }
 
       # --------------------------------------------------
-      # Debug logs
+      # Debug logs (только при падении)
       # --------------------------------------------------
       - name: Upload logs
         if: failure()
@@ -378,24 +306,26 @@ jobs:
           path: |
             **/*.log
             **/*.binlog
+          if-no-files-found: ignore
           retention-days: 7
 
       # --------------------------------------------------
-      # Release
+      # Release: драфт -> заливка -> публикация
       # --------------------------------------------------
-      - name: Create GitHub Release
-        if: success()
+      - name: Create draft release
+        id: release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: s&box Build ${{ github.ref_name }}
+          draft: true
+          tag_name: ${{ steps.reltag.outputs.tag }}
+          name: s&box Build ${{ steps.reltag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           body: |
-            ## s&box Build
+            ## s&box Build ${{ steps.reltag.outputs.tag }}
 
             Автоматическая сборка.
 
-            Commit:
-            `${{ github.sha }}`
+            Commit: `${{ github.sha }}`
 
             Включает:
 
@@ -403,6 +333,19 @@ jobs:
             - Generated manifest
             - Packaged archive
           files: |
-            sbox-${{ github.ref_name }}.7z.*
+            sbox-${{ steps.reltag.outputs.tag }}.7z.*
             manifest.json
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        run: |
+          if ([string]::IsNullOrEmpty("$env:RELEASE_ID")) {
+            Write-Error "Не получили ID драфт-релиза"
+            exit 1
+          }
+          gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" -F draft=false
+          Write-Host "🚀 Релиз опубликован: ${{ steps.reltag.outputs.tag }}"
