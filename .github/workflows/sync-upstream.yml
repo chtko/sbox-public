@@ -125,7 +125,7 @@ jobs:
           # 1. build.yml (наш кастомный билд с онлайном) — КРИТИЧНО!
           git checkout "$ORIGINAL_SHA" -- .github/workflows/build.yml 2>/dev/null \
             && echo "✅ build.yml восстановлен (Online Edition)" \
-            || echo "❌ build.bat НЕ найден!"
+            || echo "❌ build.yml НЕ найден!"
 
           # 2. sync-upstream.yml (сам workflow синхронизации)
           git checkout "$ORIGINAL_SHA" -- .github/workflows/sync-upstream.yml 2>/dev/null \
@@ -228,17 +228,17 @@ jobs:
             echo "### 🚀 Синхронизировано: \`${{ steps.upstream.outputs.version_date }}\`" >> $GITHUB_STEP_SUMMARY
             echo "**SHA:** \`${{ steps.upstream.outputs.sha }}\`"                          >> $GITHUB_STEP_SUMMARY
             echo "**Коммит:** ${{ steps.upstream.outputs.message }}"                       >> $GITHUB_STEP_SUMMARY
-            echo ""                                                                            >> $GITHUB_STEP_SUMMARY
-            echo "**Восстановленные файлы:**"                                                  >> $GITHUB_STEP_SUMMARY
-            echo "- \`gen_manifest.py\`"                                                        >> $GITHUB_STEP_SUMMARY
-            echo "- \`Setup.bat\`"                                                              >> $GITHUB_STEP_SUMMARY
-            echo "- \`sync-upstream.yml\`"                                                      >> $GITHUB_STEP_SUMMARY
-            echo "- \`build.yml\` = **Восстановлен (Online 🎮)**"                               >> $GITHUB_STEP_SUMMARY
-            echo ""                                                                            >> $GITHUB_STEP_SUMSUMMARY
-            echo "**Тег для сборки:** \`${{ steps.tag_sync.outputs.tag }}\`"                   >> $GITHUB_STEP_SUMMARY
-            echo ""                                                                            >> $GITHUB_STEP_SUMMARY
+            echo ""                                                                        >> $GITHUB_STEP_SUMMARY
+            echo "**Восстановленные файлы:**"                                              >> $GITHUB_STEP_SUMMARY
+            echo "- \`gen_manifest.py\`"                                                    >> $GITHUB_STEP_SUMMARY
+            echo "- \`Setup.bat\`"                                                          >> $GITHUB_STEP_SUMMARY
+            echo "- \`sync-upstream.yml\`"                                                  >> $GITHUB_STEP_SUMMARY
+            echo "- \`build.yml\` = **Восстановлен (Online 🎮)**"                           >> $GITHUB_STEP_SUMMARY
+            echo ""                                                                        >> $GITHUB_STEP_SUMMARY
+            echo "**Тег для сборки:** \`${{ steps.tag_sync.outputs.tag }}\`"               >> $GITHUB_STEP_SUMMARY
+            echo ""                                                                        >> $GITHUB_STEP_SUMMARY
             echo "💡 Сборка запустится автоматически — тег запушен через PAT и триггерит \`build.yml\`" >> $GITHUB_STEP_SUMMARY
           else
             echo "### ✅ Форк актуален — \`${{ steps.upstream.outputs.version_date }}\`"  >> $GITHUB_STEP_SUMMARY
-            echo "Синхронизация не требуется."                                               >> $GITHUB_STEP_SUMMARY
+            echo "Синхронизация не требуется."                                             >> $GITHUB_STEP_SUMMARY
           fi
