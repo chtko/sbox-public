@@ -13,7 +13,7 @@ name: Sync with Upstream (Version-based)
 
 on:
   schedule:
-    - cron: '0 8 * * *'   # раз в день в 08:00 UTC (14:00 Омск)
+    - cron: '0 8 * * *'   # раз в день в 08:00 UTC
   workflow_dispatch:
 
 permissions:
@@ -222,7 +222,7 @@ jobs:
             echo "- \`sync-upstream.yml\`"                                                  >> $GITHUB_STEP_SUMMARY
             echo "- \`build.yml\` = **Восстановлен (Online 🎮)**"                           >> $GITHUB_STEP_SUMMARY
             echo ""                                                                        >> $GITHUB_STEP_SUMMARY
-            echo "💡 Сборка: еженедельно по расписанию (пн 09:00 UTC / 15:00 Омск) или вручную — Actions → Build & Release s&box → Run workflow" >> $GITHUB_STEP_SUMMARY
+            echo "💡 Сборка: еженедельно по расписанию (пн 09:00 UTC) или вручную — Actions → Build & Release s&box → Run workflow" >> $GITHUB_STEP_SUMMARY
           else
             echo "### ✅ Форк актуален — \`${{ steps.upstream.outputs.version_date }}\`"  >> $GITHUB_STEP_SUMMARY
             echo "Синхронизация не требуется."                                             >> $GITHUB_STEP_SUMMARY
