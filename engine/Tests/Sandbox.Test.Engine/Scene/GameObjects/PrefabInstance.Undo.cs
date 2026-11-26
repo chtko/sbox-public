@@ -115,6 +115,74 @@ public partial class PrefabInstanceTest
 	}
 
 	[TestMethod]
+	public void RevertPrefabInstanceChangesUndoRestoresAllOverrides()
+	{
+		using var registration = RegisterBasicPrefab( out var prefab );
+		var scene = new Scene();
+		using var scope = scene.Push();
+		var instance = prefab.Clone();
+		var session = new GameEditorSession( null, scene );
+		try
+		{
+			instance.Components.Get<PrefabInstanceStatComponent>().Number = 50;
+			GetChild( instance, "ChildA" ).Components.Get<PrefabInstanceStatComponent>().Number = 60;
+			GetChild( instance, "ChildB" ).DestroyImmediate();
+			new GameObject( instance, true, "Extra" );
+			instance.PrefabInstance.RefreshPatch();
+
+			session.RevertPrefabInstanceChanges( [instance] );
+			for ( var i = 0; i < 2; i++ )
+			{
+				AssertReverted();
+				Assert.IsTrue( session.UndoSystem.Undo() );
+				Assert.AreEqual( 50, instance.Components.Get<PrefabInstanceStatComponent>().Number );
+				Assert.AreEqual( 60, GetChild( instance, "ChildA" ).Components.Get<PrefabInstanceStatComponent>().Number );
+				CollectionAssert.AreEqual( new[] { "ChildA", "Extra" }, instance.Children.Select( x => x.Name ).ToArray() );
+				Assert.IsTrue( EditorUtility.Prefabs.IsInstanceModified( instance ) );
+				Assert.IsTrue( session.UndoSystem.Redo() );
+			}
+			AssertReverted();
+		}
+		finally { session.Destroy(); }
+
+		void AssertReverted()
+		{
+			Assert.AreEqual( 5, instance.Components.Get<PrefabInstanceStatComponent>().Number );
+			Assert.AreEqual( 10, GetChild( instance, "ChildA" ).Components.Get<PrefabInstanceStatComponent>().Number );
+			CollectionAssert.AreEqual( new[] { "ChildA", "ChildB" }, instance.Children.Select( x => x.Name ).ToArray() );
+			Assert.IsFalse( EditorUtility.Prefabs.IsInstanceModified( instance ) );
+		}
+	}
+
+	[TestMethod]
+	public void RevertPrefabChildChangesUndoRestoresComponentOverride()
+	{
+		using var registration = RegisterBasicPrefab( out var prefab );
+		var scene = new Scene();
+		using var scope = scene.Push();
+		var instance = prefab.Clone();
+		var session = new GameEditorSession( null, scene );
+		try
+		{
+			instance.Components.Get<PrefabInstanceStatComponent>().Number = 50;
+			GetChild( instance, "ChildA" ).Components.Get<PrefabInstanceStatComponent>().Number = 60;
+			instance.PrefabInstance.RefreshPatch();
+
+			session.RevertPrefabInstanceChanges( [GetChild( instance, "ChildA" )] );
+			for ( var i = 0; i < 2; i++ )
+			{
+				Assert.AreEqual( 10, GetChild( instance, "ChildA" ).Components.Get<PrefabInstanceStatComponent>().Number );
+				Assert.AreEqual( 50, instance.Components.Get<PrefabInstanceStatComponent>().Number );
+				Assert.IsTrue( session.UndoSystem.Undo() );
+				Assert.AreEqual( 60, GetChild( instance, "ChildA" ).Components.Get<PrefabInstanceStatComponent>().Number );
+				Assert.AreEqual( 50, instance.Components.Get<PrefabInstanceStatComponent>().Number );
+				Assert.IsTrue( session.UndoSystem.Redo() );
+			}
+		}
+		finally { session.Destroy(); }
+	}
+
+	[TestMethod]
 	public void PrefabDifferenceCalculatorRefreshesWithSource()
 	{
 		using var registration = RegisterBasicPrefab( out var prefab );

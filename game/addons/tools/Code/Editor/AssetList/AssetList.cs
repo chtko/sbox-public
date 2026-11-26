@@ -800,13 +800,19 @@ public partial class AssetList : ListView, AssetSystem.IEventListener
 				continue;
 			}
 
-			var session = SceneEditorSession.Resolve( target );
-			using var scene = session.Scene.Push();
-			using ( session.UndoScope( "Convert GameObject To Prefab" ).WithGameObjectChanges( target, GameObjectUndoFlags.All ).Push() )
+			GameObject prefabRoot;
+			if ( SceneEditorSession.Resolve( target ) is SceneEditorSession session )
 			{
-				EditorUtility.Prefabs.ConvertGameObjectToPrefab( target, location );
-				EditorUtility.InspectorObject = target;
+				prefabRoot = session.ConvertToPrefab( [target], location );
 			}
+			else
+			{
+				using var scene = target.Scene.Push();
+				prefabRoot = EditorUtility.Prefabs.ConvertGameObjectToPrefab( target, location );
+			}
+
+			if ( prefabRoot is not null )
+				EditorUtility.InspectorObject = prefabRoot;
 
 			assetListRequiresRefresh = true;
 		}

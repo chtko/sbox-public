@@ -691,18 +691,9 @@ partial class GameObjectNode : TreeNode<GameObject>
 				var isModified = selectedGos.Any( x => (x.IsPrefabInstanceRoot && EditorUtility.Prefabs.IsInstanceModified( x ))
 													|| (x.IsPrefabInstance && EditorUtility.Prefabs.IsGameObjectInstanceModified( gameObject )) );
 
-				var revertChangesActionName = "Revert Changes";
-				prefabMenu.AddOption( revertChangesActionName, "history", () =>
+				prefabMenu.AddOption( "Revert Changes", "history", () =>
 				{
-					using var scene = SceneEditorSession.Scope();
-
-					using ( SceneEditorSession.Active.UndoScope( revertChangesActionName ).WithGameObjectChanges( selectedGos, GameObjectUndoFlags.Properties ).Push() )
-					{
-						foreach ( var go in selectedGos )
-						{
-							EditorUtility.Prefabs.RevertGameObjectInstanceChanges( go );
-						}
-					}
+					SceneEditorSession.Active.RevertPrefabInstanceChanges( selectedGos );
 				} ).Enabled = isModified;
 
 				var isAdded = selectedGos.All( x => x.IsPrefabInstance && EditorUtility.Prefabs.IsGameObjectAddedToInstance( x ) );
@@ -769,54 +760,29 @@ partial class GameObjectNode : TreeNode<GameObject>
 
 	static void ConvertToPrefab( IEnumerable<GameObject> gameObjects )
 	{
+		var selection = gameObjects.ToArray();
+		var first = selection.FirstOrDefault();
+
+		if ( first is null ) return;
+
+		var fd = new FileDialog( null );
+		fd.Title = $"Save {first.Name} as Prefab..";
+		fd.Directory = Project.Current.GetAssetsPath();
+		fd.DefaultSuffix = $".prefab";
+		fd.SelectFile( first.Name );
+		fd.SetFindFile();
+		fd.SetModeSave();
+		fd.SetNameFilter( $"Prefab File (*.prefab)" );
+
+		if ( !fd.Execute() ) return;
+
 		using var scene = SceneEditorSession.Scope();
 
-		using ( SceneEditorSession.Active.UndoScope( "Convert to Prefab" ).WithGameObjectChanges( gameObjects, GameObjectUndoFlags.All ).WithGameObjectCreations().Push() )
-		{
-			var selection = gameObjects.ToArray();
-			var first = selection.FirstOrDefault();
+		var prefabRoot = SceneEditorSession.Active.ConvertToPrefab( selection, fd.SelectedFile );
+		if ( prefabRoot is null ) return;
 
-			if ( first is null ) return;
-
-			var saveLocation = "";
-
-			var fd = new FileDialog( null );
-			fd.Title = $"Save {first.Name} as Prefab..";
-			fd.Directory = Project.Current.GetAssetsPath();
-			fd.DefaultSuffix = $".prefab";
-			fd.SelectFile( first.Name );
-			fd.SetFindFile();
-			fd.SetModeSave();
-			fd.SetNameFilter( $"Prefab File (*.prefab)" );
-
-			if ( !fd.Execute() ) return;
-
-			saveLocation = fd.SelectedFile;
-
-			GameObject prefabRoot;
-
-			if ( selection.Count() == 1 )
-			{
-				prefabRoot = first;
-			}
-			else
-			{
-				prefabRoot = new GameObject();
-				prefabRoot.WorldTransform = first.WorldTransform;
-
-				for ( var i = 0; i < selection.Length; i++ )
-				{
-					selection[i].SetParent( prefabRoot, true );
-				}
-			}
-			prefabRoot.Name = System.IO.Path.GetFileNameWithoutExtension( saveLocation );
-
-			prefabRoot = EditorUtility.Prefabs.ConvertGameObjectToPrefab( prefabRoot, saveLocation );
-			if ( prefabRoot is null ) return;
-
-			EditorUtility.InspectorObject = prefabRoot;
-			EditorScene.Selection.Set( prefabRoot );
-		}
+		EditorUtility.InspectorObject = prefabRoot;
+		EditorScene.Selection.Set( prefabRoot );
 	}
 
 	public override void OnActivated()
