@@ -1,0 +1,471 @@
+name: Build & Release s&box
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+  schedule:
+    # Еженедельная автосборка: понедельник 09:00 UTC (15:00 Омск).
+    # Подхватывает всё, что успел насинкить sync-upstream за неделю.
+    - cron: '0 9 * * 1'
+
+  workflow_dispatch:
+    inputs:
+      debug_build:
+        description: 'Debug сборка (с логами)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_VERSION: "10.x"
+  PYTHON_VERSION: "3.12"
+  STEAM_APP_ID: "480"
+  GAME_NAME: "S&box Community"
+  # Сколько новейших релизов/тегов храним, остальное чистится после каждой сборки
+  RELEASES_KEEP: "100"
+
+jobs:
+  build:
+    name: Compile Engine
+    runs-on: windows-latest
+    timeout-minutes: 180
+
+    steps:
+      # --------------------------------------------------
+      # Checkout
+      # --------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      # --------------------------------------------------
+      # Тег релиза
+      #   ручной запуск / расписание -> vГГ.ММ.ДД (например v26.07.22)
+      #   повтор в тот же день -> v26.07.22-1435
+      #   пуш тега v*    -> используем сам тег
+      # --------------------------------------------------
+      - name: Compute release tag
+        id: reltag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "push") {
+            $tag = "${{ github.ref_name }}"
+          }
+          else {
+            $tag = "v$(Get-Date -Format 'yy.MM.dd')"
+
+            # Дубль-чек по всем тегам (git ls-remote), а не по релизам через API:
+            # без пагинации, видит и сборочные, и легаси синк-теги vГГ.ММ.ДД-rN
+            $existing = git ls-remote --tags origin "refs/tags/$tag*"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "git ls-remote failed"
+              exit 1
+            }
+            if ($existing) {
+              $tag = "$tag-$(Get-Date -Format 'HHmm')"
+              Write-Host "Тег за сегодня уже существует, добавляю время: $tag"
+            }
+          }
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Release tag: $tag"
+
+      # --------------------------------------------------
+      # Toolchains
+      # --------------------------------------------------
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # --------------------------------------------------
+      # Cache
+      # --------------------------------------------------
+      - name: Cache NuGet
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', '**/*.props', '**/*.targets') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      # (кэш deps удалён: папку deps никто не создаёт — публичные артефакты
+      #  идут в game/bin/ через DownloadPublicArtifacts, сторонние в thirdparty/;
+      #  ключ hashFiles('Bootstrap.bat') всегда пустой, т.к. файл удалён upstream.
+      #  Шаг был полностью мёртвый — только тормозил и шумел в логе.)
+
+      # --------------------------------------------------
+      # Build
+      # --------------------------------------------------
+      - name: Run Bootstrap
+        shell: cmd
+        env:
+          CI: true
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEBUG_BUILD: ${{ inputs.debug_build }}
+        run: |
+          call Setup.bat
+
+      - name: Validate build output
+        shell: pwsh
+        run: |
+          $required = @("game", "game\bin", "game\bin\win64")
+          foreach ($path in $required) {
+            if (!(Test-Path $path)) {
+              Write-Error "Missing build output: $path"
+              exit 1
+            }
+          }
+          Write-Host "Build output OK"
+
+      # ════════════════════════════════════════════════════════════════════
+      #  🎯 БЛОК НАСТРОЙКИ ОНЛАЙНА
+      #  (патчинг engine2.dll убран — достаточно замены DLL)
+      # ════════════════════════════════════════════════════════════════════
+
+      - name: Replace steam_api64.dll with Goldberg
+        shell: pwsh
+        run: |
+          Write-Host "🎮 Устанавливаем Goldberg Steam Emulator..."
+
+          $win64 = "game\bin\win64"
+          $ourDll = Join-Path $env:GITHUB_WORKSPACE "dll\steam_api64.dll"
+
+          if (-not (Test-Path $ourDll)) {
+            Write-Error "❌ dll/steam_api64.dll не найден в репозитории!"
+            exit 1
+          }
+
+          Copy-Item $ourDll "$win64\steam_api64.dll" -Force
+          Write-Host "✅ steam_api64.dll заменён на Goldberg версию"
+
+      - name: Create steam_appid.txt (AppID)
+        shell: pwsh
+        run: |
+          $win64 = "game\bin\win64"
+          Set-Content "$win64\steam_appid.txt" "${{ env.STEAM_APP_ID }}"
+          Write-Host "✅ steam_appid.txt: AppID = ${{ env.STEAM_APP_ID }}"
+
+      - name: Create steam_settings
+        shell: pwsh
+        run: |
+          Write-Host "🌐 Настраиваем steam_settings..."
+
+          $settingsDir = "game\bin\win64\steam_settings"
+          New-Item -ItemType Directory -Path $settingsDir -Force | Out-Null
+
+          Set-Content "$settingsDir\account_name.txt" "SBoxPlayer"
+
+          $token = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
+          Set-Content "$settingsDir\user_token.txt" $token
+
+          Set-Content "$settingsDir\app_name.txt" "${{ env.GAME_NAME }}"
+          Set-Content "$settingsDir\override_appid.txt" "${{ env.STEAM_APP_ID }}"
+          Set-Content "$settingsDir\language.txt" "russian"
+
+          # steam_interfaces.txt генерируется отдельным шагом ниже —
+          # автоматически из бинарников игры (см. следующий step)
+
+          Set-Content "$settingsDir\connect_string.txt" "connect <IP:PORT>"
+          Write-Host "🎮 steam_settings готов"
+
+      # --------------------------------------------------------------
+      # steam_interfaces.txt: автогенерация из бинарников игры.
+      # Сканируем все dll/exe в game/bin/win64 на строки вида
+      # Steam<Name>NNN — это версии интерфейсов, которые движок
+      # реально запрашивает у steam_api. Работает при любом апдейте
+      # SDK, ручной список больше не нужен. Если игра запросит
+      # интерфейс, которого нет в нашем Goldberg — увидим [!!] в логе.
+      # --------------------------------------------------------------
+      - name: Generate steam_interfaces.txt from game binaries
+        shell: pwsh
+        run: |
+          $py = @'
+          import os, re, sys
+
+          scan_dir, goldberg_dll, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+          PAT = re.compile(rb'Steam[A-Za-z]+0\d\d')
+          CHUNK = 8 * 1024 * 1024
+          MAXB = 512 * 1024 * 1024
+
+          def scan(path):
+              found = set()
+              try:
+                  if os.path.getsize(path) > MAXB:
+                      print('skip (too big):', path)
+                      return found
+                  with open(path, 'rb') as f:
+                      tail = b''
+                      while True:
+                          chunk = f.read(CHUNK)
+                          if not chunk:
+                              break
+                          for m in PAT.finditer(tail + chunk):
+                              found.add(m.group().decode('ascii'))
+                          tail = chunk[-64:]
+              except OSError as e:
+                  print('skip (read error):', path, e)
+              return found
+
+          def fam_ver(v):
+              m = re.match(r'(Steam[A-Za-z]+)0(\d\d)$', v)
+              return (m.group(1), int(m.group(2)))
+
+          def sort_key(v):
+              f, n = fam_ver(v)
+              return (f, -n)
+
+          req = {}
+          for root, _, files in os.walk(scan_dir):
+              for fn in files:
+                  low = fn.lower()
+                  if low == 'steam_api64.dll' or not low.endswith(('.dll', '.exe')):
+                      continue
+                  p = os.path.join(root, fn)
+                  for v in scan(p):
+                      req.setdefault(v, set()).add(fn)
+
+          sup = scan(goldberg_dll) if os.path.exists(goldberg_dll) else set()
+
+          # Статический резерв (max по каждой семье, gbe_fork release-2026_08_23)
+          FALLBACK = ["SteamAppDisableUpdate001", "SteamApps008", "SteamBilling002", "SteamClient023", "SteamController008", "SteamFriends018", "SteamGameCoordinator001", "SteamGameServer015", "SteamGameServerItems003", "SteamGameServerStats001", "SteamGameStats001", "SteamHTMLSurface004", "SteamHTTP002", "SteamInput007", "SteamInventory002", "SteamMasterServerUpdater001", "SteamMatchGameSearch001", "SteamMatchMaking009", "SteamMatchMakingServers003", "SteamMatchmaking008", "SteamMatchmakingServers002", "SteamNetworking006", "SteamNetworkingMessages002", "SteamNetworkingSockets013", "SteamNetworkingSocketsSerialized005", "SteamNetworkingUtils004", "SteamParties002", "SteamRemotePlay003", "SteamRemoteStorage015", "SteamScreenshots002", "SteamStreamLauncher001", "SteamTimeline003", "SteamUGC020", "SteamUser023", "SteamUserItems003", "SteamUserStats012", "SteamUtils011", "SteamVideo002"]
+
+          if req:
+              lines = sorted(req.keys(), key=sort_key)
+              source = 'game binaries'
+          else:
+              best = {}
+              for v in sup:
+                  f, n = fam_ver(v)
+                  if f not in best or n > best[f][1]:
+                      best[f] = (v, n)
+              lines = sorted((t[0] for t in best.values()), key=sort_key) or list(FALLBACK)
+              source = 'Goldberg dll / static fallback'
+
+          with open(out_path, 'w', encoding='ascii', newline='\n') as f:
+              f.write('\n'.join(lines) + '\n')
+
+          print(f'steam_interfaces.txt: {len(lines)} entries (source: {source})')
+          for v in lines:
+              src = ','.join(sorted(req.get(v, ['<generated>'])))
+              warn = '  [!! not implemented in this Goldberg build]' if (req and sup and v not in sup) else ''
+              print(' ', v, '<-', src, warn)
+          if req and sup:
+              miss = sorted((v for v in req if v not in sup), key=sort_key)
+              if miss:
+                  print('WARNING: the game requests interfaces that this Goldberg build does not implement:')
+                  for v in miss:
+                      print('  !!', v)
+          '@
+          Set-Content -Path gen_interfaces.py -Value $py -Encoding UTF8
+          python gen_interfaces.py "game/bin/win64" "dll/steam_api64.dll" "game/bin/win64/steam_settings/steam_interfaces.txt"
+          if ($LASTEXITCODE -ne 0) { Write-Error "steam_interfaces generation failed"; exit 1 }
+          Write-Host "✅ steam_interfaces.txt сгенерирован из бинарников игры"
+
+      - name: Create ONLINE_README.txt
+        shell: pwsh
+        run: |
+          $readme = @"
+          ╔═══════════════════════════════════════════════════════════════════╗
+          ║           S&box Community Edition — Глобальный Онлайн             ║
+          ╠═══════════════════════════════════════════════════════════════════╣
+          ║                                                                   ║
+          ║  🎮 Эта сборка включает:                                          ║
+          ║     • Онлайн                                                      ║
+          ║     • Глобальный поиск игр через мастер-серверы                   ║
+          ║                                                                   ║
+          ╠═══════════════════════════════════════════════════════════════════╣
+          ║  📖 КАК ИГРАТЬ ОНЛАЙН:                                           ║
+          ╠═══════════════════════════════════════════════════════════════════╣
+          ║                                                                   ║
+          ║  1. ЗАПУСК:                                                       ║
+          ║     • Запустите game\bin\win64\sbox.exe                           ║
+          ║     • Игра автоматически подключится к сети                       ║
+          ║                                                                   ║
+          ║  2. СМЕНИТЬ НИК (опционально):                                    ║
+          ║     • Откройте game\bin\win64\steam_settings\account_name.txt     ║
+          ║     • Впишите свой ник                                            ║
+          ║                                                                   ║
+          ║  3. ПОДКЛЮЧЕНИЕ К ИГРЕ:                                           ║
+          ║     • В игре выберите "Мультиплеер" или "Сеть"                    ║
+          ║     • Подключайтесь к любому доступному серверу                   ║
+          ║                                                                   ║
+          ╚═══════════════════════════════════════════════════════════════════╝
+          "@
+          $readme | Out-File -FilePath "game\bin\win64\ONLINE_README.txt" -Encoding UTF8
+          Write-Host "📄 ONLINE_README.txt создан"
+
+      # --------------------------------------------------
+      # Documentation
+      # --------------------------------------------------
+      - name: Create build info
+        shell: pwsh
+        run: |
+          $info = @"
+          Build: ${{ github.sha }}
+          Branch: ${{ github.ref }}
+          Tag: ${{ steps.reltag.outputs.tag }}
+          Date: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+          "@
+          $info | Out-File -FilePath "game\bin\win64\BUILD_INFO.txt" -Encoding UTF8
+
+      # --------------------------------------------------
+      # Manifest
+      # --------------------------------------------------
+      - name: Generate manifest
+        shell: pwsh
+        run: |
+          if (!(Test-Path "gen_manifest.py")) {
+            Write-Error "gen_manifest.py не найден — манифест обязателен для релиза"
+            exit 1
+          }
+          python gen_manifest.py game "${{ steps.reltag.outputs.tag }}" > manifest.json
+          if (!(Test-Path manifest.json) -or (Get-Item manifest.json).Length -eq 0) {
+            Write-Error "manifest.json не создан или пуст"
+            exit 1
+          }
+          Write-Host "Manifest created"
+
+      # --------------------------------------------------
+      # Package
+      # --------------------------------------------------
+      - name: Install 7-Zip
+        shell: pwsh
+        run: |
+          if (!(Get-Command 7z -ErrorAction SilentlyContinue)) {
+            choco install 7zip -y
+          }
+
+      - name: Package build
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.reltag.outputs.tag }}"
+          $archive = "sbox-$tag.7z"
+          # Пакуем папку game целиком, чтобы пути из ONLINE_README
+          # совпадали со структурой распакованного архива
+          7z a -t7z -mx=9 -mmt=on -v2000m $archive game
+          if (!(Get-ChildItem "$archive.*" -ErrorAction SilentlyContinue)) {
+            Write-Error "Archive was not created"
+            exit 1
+          }
+          Write-Host "Created archives:"
+          Get-ChildItem "$archive.*" | ForEach-Object { Write-Host $_.Name }
+
+      # --------------------------------------------------
+      # Debug logs (только при падении)
+      # --------------------------------------------------
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            **/*.log
+            **/*.binlog
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # --------------------------------------------------
+      # Release: драфт -> заливка -> публикация
+      # --------------------------------------------------
+      - name: Create draft release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          tag_name: ${{ steps.reltag.outputs.tag }}
+          name: s&box Build ${{ steps.reltag.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body: |
+            ## s&box Build ${{ steps.reltag.outputs.tag }}
+
+            Автоматическая сборка.
+
+            Commit: `${{ github.sha }}`
+
+            Включает:
+
+            - Source build
+            - Generated manifest
+            - Packaged archive
+          files: |
+            sbox-${{ steps.reltag.outputs.tag }}.7z.*
+            manifest.json
+          fail_on_unmatched_files: true
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+        run: |
+          if ([string]::IsNullOrEmpty("$env:RELEASE_ID")) {
+            Write-Error "Не получили ID драфт-релиза"
+            exit 1
+          }
+          gh api -X PATCH "repos/$env:GITHUB_REPOSITORY/releases/$env:RELEASE_ID" -F draft=false
+          Write-Host "🚀 Релиз опубликован: ${{ steps.reltag.outputs.tag }}"
+
+      # --------------------------------------------------
+      # Чистка хвоста: храним не более RELEASES_KEEP новейших
+      # релизов и тегов v*, остальное удаляем.
+      #   - теги формата vГГ.ММ.ДД[-HHmm] сортируются лексикографически
+      #     = хронологически (нули в дате + фиксированная ширина полей)
+      #   - учитываются и «осиротевшие» теги без релизов
+      #     (легаси синк-теги vГГ.ММ.ДД-rN)
+      # Хаускипинг: шаг не может уронить сборку (continue-on-error).
+      # --------------------------------------------------
+      - name: Cleanup old releases and tags (keep newest ${{ env.RELEASES_KEEP }})
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $keep = [int]$env:RELEASES_KEEP
+
+          # 1. Релизы: удаляем всё, что старше newest $keep
+          #    (API отдаёт новейшие первыми, --paginate покрывает весь список)
+          $relTags = @(gh api "repos/$env:GITHUB_REPOSITORY/releases" --paginate --jq '.[].tag_name' 2>$null | Where-Object { $_ })
+          $doomRels = @($relTags | Sort-Object -Descending | Select-Object -Skip $keep)
+          foreach ($t in $doomRels) {
+            Write-Host "🗑 Удаляю релиз: $t"
+            gh release delete $t --yes
+            if ($LASTEXITCODE -ne 0) { Write-Host "  ⚠️ пропускаю релиз $t" }
+          }
+
+          # 2. Теги v* (включая те, у кого релиз уже удалён)
+          $raw = git ls-remote --tags origin 'refs/tags/v*'
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "⚠️ git ls-remote недоступен — чистка тегов пропущена"
+          }
+          else {
+            # строки вида "<sha>\trefs/tags/v..."; у аннотированных тегов
+            # вторая строка с ^{} — срезаем и дедуплицируем
+            $allTags = @($raw | ForEach-Object { ($_ -split '\t', 2)[1] } |
+              Where-Object { $_ -match '^refs/tags/v' } |
+              ForEach-Object { $_ -replace '\^\{\}$', '' } |
+              Sort-Object -Unique -Descending)
+            $doomTags = @($allTags | Select-Object -Skip $keep)
+            foreach ($t in $doomTags) {
+              Write-Host "🗑 Удаляю тег: $t"
+              gh api -X DELETE "repos/$env:GITHUB_REPOSITORY/git/refs/tags/$t"
+              if ($LASTEXITCODE -ne 0) { Write-Host "  ⚠️ пропускаю тег $t" }
+            }
+            Write-Host "🧹 Итог: релизов $($relTags.Count), тегов v* $($allTags.Count), лимит $keep, удалено релизов $($doomRels.Count), тегов $($doomTags.Count)"
+          }
